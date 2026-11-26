@@ -323,12 +323,39 @@ function confirmPayment(p) {
   p.commission = Math.round(p.amount * COMMISSION_RATE);
   st.paidUntil = Math.max(Date.now(), st.paidUntil || 0) + PAID_DAYS * DAY;
   saveDb();
+  const parent = db.users.find((u) => u.id === p.parentId);
+  if (parent) sendSms(parent.phone, 'Hongera mzazi kwa ushirikiano wako. Walimu wetu wataweka juhudi kubwa ili kupata matokeo bora kwa mtoto wako.', 'paid')
+    .catch((e) => console.error('SMS ya shukrani imeshindwa:', e.message));
   return true;
 }
 const balanceOf = (schoolId) =>
   db.payments.filter((p) => p.schoolId === schoolId && p.status === 'paid').reduce((a, p) => a + p.commission, 0) -
   db.withdrawals.filter((w) => w.schoolId === schoolId && w.status !== 'rejected').reduce((a, w) => a + w.amount, 0);
 
+// ---- Akaunti zisizotumika kwa miezi 2 (siku 60) zinafutwa zenyewe
+const INACTIVE_MS = Math.max(1, Number(process.env.INACTIVE_DAYS) || 60) * DAY;
+function touchSeen(u) { const n = Date.now(); if (n - (u.lastSeen || 0) > HOUR) { u.lastSeen = n; saveDb(); } }
+function sweepInactive() {
+  const now = Date.now();
+  const idle = (u) => now - (u.lastSeen || u.createdAt || 0) > INACTIVE_MS;
+  const dropParents = new Set(db.users.filter((u) => u.role === 'parent' && idle(u)).map((u) => u.id));
+  // Shule yenye salio la kamisheni au ombi la kutoa pesa linalosubiri HAIFUTWI (pesa ya shule isipotee)
+  const dropSchools = new Set(db.users.filter((u) => u.role === 'school' && idle(u) && balanceOf(u.id) <= 0 && !db.withdrawals.some((w) => w.schoolId === u.id && w.status === 'pending')).map((u) => u.id));
+  if (!dropParents.size && !dropSchools.size) return { schools: 0, parents: 0 };
+  for (const u of db.users.filter((x) => dropSchools.has(x.id))) { const f = schoolPhotoFile(u); if (f) try { fs.rmSync(f, { force: true }); } catch {} }
+  const stuIds = new Set(db.students.filter((st) => dropSchools.has(st.schoolId)).map((st) => st.id));
+  for (const st of db.students.filter((x) => stuIds.has(x.id))) for (const e of Object.keys(PHOTO_TYPES)) { try { fs.rmSync(path.join(PHOTO_DIR, st.id + '.' + e), { force: true }); } catch {} }
+  for (const u of db.users) if (u.role === 'parent' && stuIds.has(u.studentId)) dropParents.add(u.id);
+  db.users = db.users.filter((u) => !dropParents.has(u.id) && !dropSchools.has(u.id));
+  db.classes = db.classes.filter((c) => !dropSchools.has(c.schoolId));
+  db.students = db.students.filter((st) => !stuIds.has(st.id));
+  db.staff = db.staff.filter((x) => !dropSchools.has(x.schoolId));
+  db.timetable = db.timetable.filter((x) => !dropSchools.has(x.schoolId));
+  db.results = db.results.filter((x) => !stuIds.has(x.studentId));
+  saveDb();
+  console.log(`Imefuta akaunti zisizotumika: shule ${dropSchools.size}, wazazi ${dropParents.size}`);
+  return { schools: dropSchools.size, parents: dropParents.size };
+}
 const parentsOfStudent = (studentId) => db.users.filter((u) => u.role === 'parent' && u.studentId === studentId);
 const parentLocked = (parent, st) => !((st.paidUntil || 0) > Date.now()) && Date.now() > parent.createdAt + TRIAL_MS;
 // ---- picha za wanafunzi (zinahifadhiwa kwenye diski, zinaonekana kwa shule na mzazi wa mwanafunzi huyo tu)
@@ -361,13 +388,14 @@ function route(method, p, opts, fn) {
 }
 
 // ---- usajili
-route('POST', '/api/register/school', {}, async ({ body, ip }) => {
+route('POST', '/api/register/school', { maxBody: 700e3 }, async ({ body, ip }) => {
   rate('reg:' + ip, REG_PER_HOUR, HOUR);
   const school = str(body.school, 2, 100, 'Jina la shule');
-  const type = ['msingi', 'sekondari'].includes(body.type) ? body.type : 'msingi';
+  const type = ['chekechea', 'msingi', 'sekondari'].includes(body.type) ? body.type : 'msingi';
   const name = str(body.name, 2, 80, 'Jina la msimamizi');
   const phone = phoneNorm(body.phone);
   const pw = password(body.password);
+  const img = body.photo ? parseImage(body.photo) : null; // hakiki picha kabla ya kuunda akaunti
   const check = () => {
     if (db.users.some((u) => u.phone === phone)) throw bad('Namba hii tayari imesajiliwa. Tafadhali ingia.');
     if (db.users.some((u) => u.role === 'school' && u.schoolKey === schoolKey(school)))
@@ -377,7 +405,8 @@ route('POST', '/api/register/school', {}, async ({ body, ip }) => {
   checkOtp('register', phone, '', body.otp);
   const passHash = await hashPassword(pw);
   check(); // hakiki tena: maombi mawili ya wakati mmoja yasipite yote mawili
-  const user = { id: uid(), role: 'school', name, phone, schoolName: school, schoolKey: schoolKey(school), schoolType: type, passHash, createdAt: Date.now() };
+  const user = { id: uid(), role: 'school', name, phone, schoolName: school, schoolKey: schoolKey(school), schoolType: type, passHash, createdAt: Date.now(), lastSeen: Date.now() };
+  if (img) { fs.mkdirSync(PHOTO_DIR, { recursive: true }); fs.writeFileSync(path.join(PHOTO_DIR, 'school-' + user.id + '.' + img.ext), img.buf, { mode: 0o600 }); user.photoExt = img.ext; }
   db.users.push(user); saveDb();
   // Namba imethibitishwa kwa OTP, kwa hiyo ni salama kutuma ujumbe wa kukaribisha (haukatwi kwenye ukomo wa SMS)
   sendSms(phone, 'Hongera mwalimu! Umefanikiwa kuunganisha shule yako na mfumo wa SCHOOL LUBA TECH. Sasa weka taarifa za wanafunzi kwa usahihi na usubiri kamisheni ya 35% kwa kila mzazi atakayelipia shilingi elfu moja kwa mwezi. Ubarikiwe mwalimu kwa ushirikiano wako.', 'welcome')
@@ -395,18 +424,17 @@ route('POST', '/api/register/parent', {}, async ({ body, ip }) => {
   const birth = dob(body.dobDay, body.dobYear);
   const check = () => {
     if (db.users.some((u) => u.phone === phone)) throw bad('Namba hii tayari imesajiliwa. Tafadhali ingia.');
+    // Mwanafunzi anatafutwa kwa jina la shule + namba. Tarehe ya kuzaliwa haikatai usajili tena; ikitofautiana, shule inaonyeshwa alama.
     const st = db.students.find((s) => s.schoolKey === schoolKey(school) && s.studentNo.toLowerCase() === studentNo.toLowerCase());
-    if (st && st.dob !== birth) rate('bind:' + st.id, 8, DAY); // kikomo cha makosa kwa kila mwanafunzi (kuzuia kubashiri tarehe)
-    if (st && st.dob === birth && parentsOfStudent(st.id).length >= 3) throw bad('Mwanafunzi huyu ana wazazi wengi waliosajiliwa tayari. Wasiliana na shule.');
-    // Ujumbe mmoja kwa hitilafu zote ili kuzuia kubashiri namba za wanafunzi
-    if (!st || st.dob !== birth) throw bad('Taarifa za mwanafunzi hazilingani. Hakikisha jina la shule, namba na tarehe ya kuzaliwa, au wasiliana na shule.');
+    if (!st) { rate('nf:' + schoolKey(school), 60, HOUR); throw bad('Taarifa za mwanafunzi hazilingani. Hakikisha jina la shule na namba ya mwanafunzi, au wasiliana na shule.'); } // kikomo cha kubashiri namba za wanafunzi
+    if (parentsOfStudent(st.id).length >= 3) throw bad('Mwanafunzi huyu ana wazazi wengi waliosajiliwa tayari. Wasiliana na shule.');
     return st;
   };
   check();
   checkOtp('register', phone, '', body.otp);
   const passHash = await hashPassword(pw);
   const st = check();
-  const user = { id: uid(), role: 'parent', name, phone, studentId: st.id, passHash, createdAt: Date.now() };
+  const user = { id: uid(), role: 'parent', name, phone, studentId: st.id, passHash, createdAt: Date.now(), lastSeen: Date.now(), dobMismatch: st.dob !== birth };
   db.users.push(user); saveDb();
   return { token: signToken(user), role: 'parent', name };
 });
@@ -419,6 +447,7 @@ route('POST', '/api/login', {}, async ({ body, ip }) => {
   const u = db.users.find((x) => x.phone === phone);
   const ok = await verifyPassword(typeof body.password === 'string' ? body.password : '', u && u.passHash);
   if (!u || !ok) throw new HttpError(401, 'Namba ya simu au nenosiri si sahihi');
+  u.lastSeen = Date.now(); saveDb();
   return { token: signToken(u), role: u.role, name: u.role === 'school' ? u.schoolName : u.name };
 });
 
@@ -520,7 +549,7 @@ route('GET', '/api/school/me', { auth: 'school' }, ({ user }) => {
   const now = Date.now(), mk = monthKey(now);
   const q = smsQuota(user);
   return {
-    school: user.schoolName, type: user.schoolType, contact: user.name, phone: phoneShow(user.phone),
+    school: user.schoolName, type: user.schoolType, hasPhoto: !!user.photoExt, contact: user.name, phone: phoneShow(user.phone),
     students: sts.length,
     classes: db.classes.filter((c) => c.schoolId === user.id).length,
     parentsRegistered: sts.reduce((a, s) => a + parentsOfStudent(s.id).length, 0),
@@ -585,6 +614,26 @@ route('POST', '/api/parent/photo', { auth: 'parent', maxBody: 700e3 }, ({ user, 
   rate('photo:' + user.id, 20, HOUR);
   savePhoto(db.students.find((s) => s.id === user.studentId), body.image);
   return { ok: true };
+});
+function schoolPhotoFile(u) { return u && u.photoExt && path.join(PHOTO_DIR, 'school-' + u.id + '.' + u.photoExt); }
+route('POST', '/api/school/photo', { auth: 'school', maxBody: 700e3 }, ({ user, body }) => {
+  rate('photo:' + user.id, 20, HOUR);
+  const { buf, ext } = parseImage(body.image);
+  fs.mkdirSync(PHOTO_DIR, { recursive: true });
+  const old = schoolPhotoFile(user); if (old) fs.rmSync(old, { force: true });
+  fs.writeFileSync(path.join(PHOTO_DIR, 'school-' + user.id + '.' + ext), buf, { mode: 0o600 });
+  user.photoExt = ext; saveDb();
+  return { ok: true };
+});
+route('GET', '/api/school/photo', { auth: 'school' }, ({ user }) => {
+  const f = schoolPhotoFile(user);
+  if (!f || !fs.existsSync(f)) throw new HttpError(404, 'Picha haipo');
+  return { __raw: fs.readFileSync(f), type: PHOTO_TYPES[user.photoExt] };
+});
+route('GET', '/api/admin/school/:id/photo', { admin: true }, ({ params }) => {
+  const f = schoolPhotoFile(db.users.find((u) => u.id === params.id && u.role === 'school'));
+  if (!f || !fs.existsSync(f)) throw new HttpError(404, 'Picha haipo');
+  return { __raw: fs.readFileSync(f), type: PHOTO_TYPES[db.users.find((u) => u.id === params.id).photoExt] };
 });
 route('GET', '/api/photo/:id', { auth: ['school', 'parent'] }, ({ user, params }) => {
   const st = db.students.find((s) => s.id === params.id);
@@ -714,7 +763,7 @@ route('POST', '/api/school/results', { auth: 'school' }, async ({ user, body }) 
 route('GET', '/api/school/parents', { auth: 'school' }, ({ user }) => {
   const now = Date.now();
   return db.students.filter((s) => s.schoolId === user.id).flatMap((s) => parentsOfStudent(s.id).map((p) => ({
-    id: p.id, name: p.name, phone: phoneShow(p.phone), studentName: s.name,
+    id: p.id, name: p.name, phone: phoneShow(p.phone), studentName: s.name, dobMismatch: !!p.dobMismatch,
     className: (db.classes.find((c) => c.id === s.classId) || {}).name || '', paid: (s.paidUntil || 0) > now,
   }))).sort((a, b) => a.name.localeCompare(b.name));
 });
@@ -893,7 +942,7 @@ route('GET', '/api/admin/overview', { admin: true }, () => ({
     pendingWithdrawals: db.withdrawals.filter((w) => w.status === 'pending').reduce((a, w) => a + w.amount, 0),
   },
   schools: db.users.filter((u) => u.role === 'school').map((u) => ({
-    id: u.id, school: u.schoolName, contact: u.name, phone: phoneShow(u.phone), payoutPhone: phoneShow(u.payoutPhone || u.phone), sms: smsQuota(u), balance: balanceOf(u.id),
+    id: u.id, hasPhoto: !!u.photoExt, school: u.schoolName, contact: u.name, phone: phoneShow(u.phone), payoutPhone: phoneShow(u.payoutPhone || u.phone), sms: smsQuota(u), balance: balanceOf(u.id),
     students: db.students.filter((s) => s.schoolId === u.id).length,
     paidStudents: db.students.filter((s) => s.schoolId === u.id && (s.paidUntil || 0) > Date.now()).length,
     collected: db.payments.filter((p) => p.schoolId === u.id && p.status === 'paid').reduce((a, p) => a + p.amount, 0),
@@ -935,6 +984,67 @@ route('POST', '/api/admin/withdrawals/reject', { admin: true }, ({ body }) => {
 
 route('GET', '/api/health', {}, () => ({ ok: true }));
 
+// ---- Video ya ukurasa wa mbele na Wimbo wa Taifa (admin anapakia; kila mtu anaona/anasikia)
+const MEDIA_DIR = path.join(path.dirname(DATA_FILE), 'media');
+const MEDIA_TYPES = { mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', m4a: 'audio/mp4', ogg: 'audio/ogg', wav: 'audio/wav' };
+const SLOTS = ['v1', 'v2', 'v3', 'v4', 'v5', 'v6']; // sehemu sita za video, kila moja sekunde 5
+const MEDIA_MAX = { v1: 15e6, v2: 15e6, v3: 15e6, v4: 15e6, v5: 15e6, v6: 15e6, anthem: 12e6 };
+function mediaExt(kind, b) {
+  const t = (o, str) => b.subarray(o, o + str.length).toString('latin1') === str;
+  const mp4 = b.length > 12 && t(4, 'ftyp'), webm = b.length > 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3;
+  if (kind !== 'anthem') return mp4 ? 'mp4' : webm ? 'webm' : null;
+  if (t(0, 'ID3') || (b[0] === 0xff && (b[1] & 0xe0) === 0xe0)) return 'mp3';
+  if (t(0, 'OggS')) return 'ogg';
+  if (t(0, 'RIFF') && t(8, 'WAVE')) return 'wav';
+  return mp4 ? 'm4a' : null;
+}
+route('GET', '/api/public/media', {}, () => {
+  const m = db.meta.media || {}, o = {};
+  o.videos = SLOTS.filter((k) => m[k]).map((k) => ({ slot: k, url: '/media/' + k + '?v=' + m[k].at }));
+  o.anthem = m.anthem ? { url: '/media/anthem?v=' + m.anthem.at } : null;
+  return o;
+});
+route('POST', '/api/admin/media/:kind', { admin: true, binary: true, maxBody: 16e6 }, ({ raw, params }) => {
+  const kind = params.kind;
+  if (!MEDIA_MAX[kind]) throw new HttpError(404, 'Haipo');
+  if (!raw || raw.length < 100 || raw.length > MEDIA_MAX[kind]) throw bad('Faili ni kubwa mno');
+  const ext = mediaExt(kind, raw);
+  if (!ext) throw bad(kind !== 'anthem' ? 'Video lazima iwe MP4 au WEBM' : 'Wimbo lazima uwe MP3, M4A, OGG au WAV');
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  for (const e of Object.keys(MEDIA_TYPES)) fs.rmSync(path.join(MEDIA_DIR, kind + '.' + e), { force: true });
+  fs.writeFileSync(path.join(MEDIA_DIR, kind + '.' + ext), raw, { mode: 0o600 });
+  (db.meta.media = db.meta.media || {})[kind] = { ext, size: raw.length, at: Date.now() };
+  saveDb();
+  return { ok: true };
+});
+route('POST', '/api/admin/media/:kind/delete', { admin: true }, ({ params }) => {
+  const kind = params.kind;
+  if (!MEDIA_MAX[kind]) throw new HttpError(404, 'Haipo');
+  for (const e of Object.keys(MEDIA_TYPES)) fs.rmSync(path.join(MEDIA_DIR, kind + '.' + e), { force: true });
+  if (db.meta.media) delete db.meta.media[kind];
+  saveDb();
+  return { ok: true };
+});
+function serveMedia(req, res, kind) {
+  const m = (db.meta.media || {})[kind];
+  const file = m && path.join(MEDIA_DIR, kind + '.' + m.ext);
+  let st; try { st = file && fs.statSync(file); } catch {}
+  if (!st) { res.writeHead(404); return res.end(); }
+  let start = 0, end = st.size - 1, status = 200;
+  const r = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
+  if (r && (r[1] !== '' || r[2] !== '')) {
+    if (r[1] !== '') { start = Number(r[1]); if (r[2] !== '') end = Math.min(Number(r[2]), end); }
+    else start = Math.max(0, st.size - Number(r[2]));
+    if (start > end || start >= st.size) { res.writeHead(416, { 'Content-Range': 'bytes */' + st.size }); return res.end(); }
+    status = 206;
+  }
+  const hdr = { 'Content-Type': MEDIA_TYPES[m.ext], 'Accept-Ranges': 'bytes', 'Content-Length': end - start + 1, 'Cache-Control': 'public, max-age=86400' };
+  if (status === 206) hdr['Content-Range'] = `bytes ${start}-${end}/${st.size}`;
+  res.writeHead(status, hdr);
+  if (req.method === 'HEAD') return res.end();
+  fs.createReadStream(file, { start, end }).pipe(res);
+}
+
 // ---------------------------------------------------------------- server
 // Ukurasa wa mbele uko ndani ya faili hili (build.js inaweka HTML hapa). Wakati wa maendeleo unasomwa kutoka public/index.html.
 const INDEX_EMBED = /*__INDEX_HTML__*/ null;
@@ -945,11 +1055,11 @@ const INDEX_HTML = (INDEX_EMBED !== null ? INDEX_EMBED : fs.readFileSync(path.jo
 const INDEX_GZ = zlib.gzipSync(Buffer.from(INDEX_HTML), { level: 9 }); // ukurasa mdogo = unafunguka haraka kwenye simu
 const INDEX_ETAG = '"' + crypto.createHash('sha256').update(INDEX_HTML).digest('hex').slice(0, 20) + '"';
 
-function readBody(req, limit) {
+function readBody(req, limit, binary) {
   return new Promise((resolve, reject) => {
     let size = 0; const chunks = [];
     req.on('data', (c) => { size += c.length; if (size > limit) { reject(new HttpError(413, 'Ombi ni kubwa mno')); req.destroy(); } else chunks.push(c); });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => resolve(binary ? Buffer.concat(chunks) : Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
 }
@@ -975,6 +1085,8 @@ const server = http.createServer(async (req, res) => {
     const { pathname } = new URL(req.url, 'http://x');
     if (!pathname.startsWith('/api/')) {
       if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end(); }
+      const mm = /^\/media\/(v[1-6]|anthem)$/.exec(pathname);
+      if (mm) return serveMedia(req, res, mm[1]);
       if (pathname !== '/' && pathname !== '/index.html') { res.writeHead(404); return res.end('Haipo'); }
       const hdr = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', ETag: INDEX_ETAG, Vary: 'Accept-Encoding' };
       if (req.headers['if-none-match'] === INDEX_ETAG) { res.writeHead(304, hdr); return res.end(); }
@@ -1002,10 +1114,11 @@ const server = http.createServer(async (req, res) => {
       user = readToken(req.headers.authorization);
       if (!user) throw new HttpError(401, 'Tafadhali ingia tena');
       if (![].concat(match.opts.auth).includes(user.role)) throw new HttpError(403, 'Hauruhusiwi');
+      touchSeen(user);
     }
-    const raw = req.method === 'POST' ? await readBody(req, match.opts.maxBody || 100e3) : '';
+    const raw = req.method === 'POST' ? await readBody(req, match.opts.maxBody || 100e3, match.opts.binary) : '';
     let body = {};
-    if (raw) { try { body = JSON.parse(raw); } catch { throw bad('Data si sahihi'); } }
+    if (raw && !match.opts.binary) { try { body = JSON.parse(raw); } catch { throw bad('Data si sahihi'); } }
     if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bad('Data si sahihi');
     const out = await match.fn({ req, raw, body, params, user, ip });
     if (out && out.__raw) {
@@ -1023,4 +1136,5 @@ server.requestTimeout = 30e3;
 server.headersTimeout = 15e3;
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
 
+sweepInactive(); setInterval(sweepInactive, 6 * HOUR).unref();
 server.listen(PORT, () => console.log(`SCHOOL LUBA TECH inaendeshwa: http://localhost:${PORT}  (gateway=${GATEWAY}, sms=${SMS_PROVIDER})`));

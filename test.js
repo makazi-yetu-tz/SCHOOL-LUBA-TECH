@@ -107,7 +107,6 @@ const ok = (name) => { passed++; console.log('  ✓ ' + name); };
 
   // --- mzazi
   const parentBody = { name: 'Amina Hassan', phone: '0655111222', password: 'parent123', school: 'shule ya msingi UHURU', studentNo: '2024-042', dobDay: '15/03', dobYear: '2018' };
-  assert.equal((await call('POST', '/api/register/parent', { ...parentBody, dobYear: '2017' })).status, 400); ok('tarehe ya kuzaliwa isiyolingana inakataliwa');
   assert.equal((await call('POST', '/api/register/parent', { ...parentBody, studentNo: '999' })).status, 400); ok('mwanafunzi asiyekuwepo anakataliwa');
   r = await call('POST', '/api/register/parent', parentBody); assert.equal(r.status, 200); const P = r.data.token; ok('mzazi anajisajili');
   assert.equal((await call('GET', '/api/school/me', undefined, P)).status, 403); ok('mzazi hawezi kufikia API ya shule');
@@ -175,6 +174,7 @@ const ok = (name) => { passed++; console.log('  ✓ ' + name); };
   r = await call('GET', '/api/pay/status/' + pid, undefined, P); assert.equal(r.data.status, 'paid'); ok('webhook halali inathibitisha malipo');
   r = await call('GET', '/api/school/me', undefined, S);
   assert.equal(r.data.balance, 350); assert.equal(r.data.paidParents, 1); ok('shule inapata 35% = TSh 350 (mara moja tu hata webhook ikirudiwa)');
+  await sleep(50); assert.equal((log.match(/Hongera mzazi kwa ushirikiano wako\. Walimu wetu wataweka juhudi kubwa ili kupata matokeo bora kwa mtoto wako\./g) || []).length, 1); ok('mzazi anatumiwa SMS ya shukrani mara moja tu baada ya malipo (hata webhook ikirudiwa)');
   assert.equal((await call('POST', '/api/pay/initiate', {}, P)).status, 400); ok('hawezi kulipa tena akiwa amelipia');
 
   // --- kutoa pesa
@@ -242,8 +242,12 @@ const ok = (name) => { passed++; console.log('  ✓ ' + name); };
   assert.equal(JSON.stringify(JSON.parse(fs.readFileSync(dataFile, 'utf8')).sms).includes(code), false); ok('OTP haihifadhiwi wazi kwenye hifadhidata');
 
   const guess = [];
-  for (let i = 0; i < 10; i++) guess.push((await call('POST', '/api/register/parent', { name: 'Mgeni Mbaya', phone: '07880000' + (10 + i), password: 'secret123', school: 'Shule ya Msingi Uhuru', studentNo: '2024-042', dobDay: '0' + (1 + (i % 9)) + '/01', dobYear: '2018' })).status);
-  assert.ok(guess.includes(429), 'kubashiri tarehe lazima kuzuiwe: ' + guess.join(',')); ok('kubashiri tarehe ya kuzaliwa ya mwanafunzi kunazuiwa baada ya makosa 8');
+  for (let i = 0; i < 70; i++) guess.push((await call('POST', '/api/register/parent', { name: 'Mgeni Mbaya', phone: '07880' + String(10000 + i), password: 'secret123', school: 'Shule ya Msingi Uhuru', studentNo: 'bashiri-' + i, dobDay: '01/01', dobYear: '2018' })).status);
+  assert.ok(guess.includes(429), 'kubashiri namba za wanafunzi lazima kuzuiwe: ' + guess.join(',')); ok('kubashiri namba za wanafunzi kunazuiwa baada ya majaribio 60 kwa saa');
+
+  await call('POST', '/api/school/students', { classId: C4, studentNo: 'MM-1', name: 'Mtoto Tarehe', dobDay: '01/01', dobYear: '2018' }, S);
+  r = await call('POST', '/api/register/parent', { ...parentBody, name: 'Mzazi Tarehe', phone: '0655111999', studentNo: 'MM-1', dobYear: '2016' }); assert.equal(r.status, 200); const PX = r.data.token; ok('tarehe ya kuzaliwa isiyolingana haikatazwi (mzazi anajisajili)');
+  r = await call('GET', '/api/school/parents', undefined, S); assert.equal(r.data.find((x) => x.name === 'Amina Hassan').dobMismatch, false); assert.equal(r.data.length >= 2, true); assert.ok(r.data.some((x) => x.dobMismatch === true)); ok('shule inaona alama ya tarehe isiyolingana kwa mzazi husika tu');
 
   // --- ulinzi wa ziada
   for (const bad of ['Shule www.bet.com', 'Shule http://x.co', 'Shule bet@gmail', 'Shule 0712345678901']) {

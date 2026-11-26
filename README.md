@@ -93,3 +93,6 @@ curl -X POST -H "x-admin-key: $ADMIN_KEY" -H "Content-Type: application/json" \
 2. Kwenye seva/hosting (Render, Railway, VPS n.k.): `npm start` (inaendesha `school-luba-tech.js`, hakuna `npm install` inayohitajika).
 3. Weka vigezo kutoka `.env.example` kwenye mipangilio ya hosting (siyo kwenye GitHub): `SESSION_SECRET`, `ADMIN_KEY`, NextSMS, DaliPay, `NODE_ENV=production`.
 4. Hifadhi data kwenye diski ya kudumu: weka `DATA_FILE=/njia/ya/diski/db.json` (picha huhifadhiwa kando yake kwenye `photos/`). Bila hili data inaweza kupotea hosting ikianzishwa upya.
+
+## Video na Wimbo wa Taifa
+Admin anapakia video (MP4/WEBM, hadi 30MB; inachezwa sekunde 30 za kwanza) na Wimbo wa Taifa (MP3/M4A/OGG/WAV, hadi 12MB) kwenye ukurasa wa Admin. Faili zinahifadhiwa kando ya `DATA_FILE` kwenye folda ya `media/`.
